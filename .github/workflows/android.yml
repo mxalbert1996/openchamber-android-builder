@@ -1,0 +1,174 @@
+name: Android stable
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  repository_dispatch:
+    types: [upstream-release]
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/android.yml'
+      - 'scripts/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-stable
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      build: ${{ steps.upstream.outputs.build }}
+      tag: ${{ steps.upstream.outputs.tag }}
+      version: ${{ steps.upstream.outputs.version }}
+      commit: ${{ steps.upstream.outputs.commit }}
+      bun: ${{ steps.upstream.outputs.bun }}
+      version_code: ${{ steps.upstream.outputs.version_code }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - name: Find latest upstream stable
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/upstream.mjs
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        if: steps.upstream.outputs.build == 'true'
+        with:
+          repository: openchamber/openchamber
+          ref: ${{ steps.upstream.outputs.commit }}
+          path: upstream
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        if: steps.upstream.outputs.build == 'true'
+        with:
+          bun-version: ${{ steps.upstream.outputs.bun }}
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        if: steps.upstream.outputs.build == 'true'
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        if: steps.upstream.outputs.build == 'true'
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+      - name: Patch app update source and build Android only
+        if: steps.upstream.outputs.build == 'true'
+        env:
+          OPENCHAMBER_ANDROID_VERSION_NAME: ${{ steps.upstream.outputs.version }}
+          OPENCHAMBER_ANDROID_VERSION_CODE: ${{ steps.upstream.outputs.version_code }}
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: |
+          node scripts/patch-updates.mjs upstream "$GITHUB_REPOSITORY"
+          cd upstream
+          bun install --frozen-lockfile --ignore-scripts
+          bun run --cwd packages/sdk build
+          bun run --cwd packages/mobile build
+          (cd packages/mobile && bunx --no-install cap sync android)
+          bash packages/mobile/android/gradlew --no-daemon -p packages/mobile/android assembleRelease
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.upstream.outputs.build == 'true'
+        with:
+          name: unsigned-apk
+          path: upstream/packages/mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    needs: build
+    if: needs.build.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Keep upstream build scripts away from publishing and OIDC credentials.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      VERSION: ${{ needs.build.outputs.version }}
+      UPSTREAM_COMMIT: ${{ needs.build.outputs.commit }}
+      BUN_VERSION: ${{ needs.build.outputs.bun }}
+      VERSION_CODE: ${{ needs.build.outputs.version_code }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: 'build-tools;35.0.0'
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: unsigned-apk
+          path: unsigned
+      - name: Sign with the public Android test key
+        run: bash scripts/sign-apk.sh
+      - name: Record build source and hashes
+        run: |
+          jq -n \
+            --arg upstream_commit "$UPSTREAM_COMMIT" --arg upstream_tag "$TAG" \
+            --arg builder "$GITHUB_REPOSITORY" --arg builder_commit "$GITHUB_SHA" \
+            --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg bun "$BUN_VERSION" --arg version "$VERSION" --argjson code "$VERSION_CODE" \
+            '{upstream: "openchamber/openchamber", upstream_commit: $upstream_commit,
+              upstream_tag: $upstream_tag, builder: $builder, builder_commit: $builder_commit,
+              run: $run, bun: $bun, version: $version, version_code: $code,
+              signing: "PUBLIC AOSP testkey", modification: "Android app updates use builder GitHub releases",
+              update_url: ("https://api.github.com/repos/" + $builder + "/releases/latest")}' \
+            > dist/build-info.json
+          (cd dist && sha256sum ./*.apk build-info.json > SHA256SUMS)
+      - name: Attest signed APK and build metadata
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          create-storage-record: false
+          subject-path: |
+            dist/*.apk
+            dist/build-info.json
+            dist/SHA256SUMS
+      - name: Publish attested release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          test -s "$ATTESTATION_BUNDLE"
+          cp "$ATTESTATION_BUNDLE" dist/provenance.sigstore.json
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          Unofficial Android build of [OpenChamber $TAG](https://github.com/openchamber/openchamber/releases/tag/$TAG).
+          Upstream commit: \`$UPSTREAM_COMMIT\`.
+
+          本 APK 将应用更新检查改为本仓库，并使用公开 AOSP 测试密钥签名。非官方构建，风险自担。
+          This APK checks this repository for app updates and uses the public AOSP test key. Unofficial build; use at your own risk.
+
+          Verify before installing:
+          \`gh attestation verify OpenChamber-$VERSION-android.apk --repo $GITHUB_REPOSITORY --signer-workflow $GITHUB_REPOSITORY/.github/workflows/android.yml\`
+          EOF
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft > "$RUNNER_TEMP/release.json"; then
+            jq -e '.isDraft == true' "$RUNNER_TEMP/release.json"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --draft --title "OpenChamber $TAG - Android" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --notes-file "$RUNNER_TEMP/notes.md" --draft=false --latest

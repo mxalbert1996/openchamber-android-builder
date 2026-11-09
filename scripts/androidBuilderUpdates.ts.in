@@ -1,0 +1,41 @@
+import { z } from 'zod';
+import type { UpdateInfo } from '@/lib/desktop';
+
+const repository = '__BUILDER_REPOSITORY__';
+const versionSchema = z.string().regex(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
+const releaseSchema = z.object({
+  tag_name: z.string(),
+  draft: z.literal(false),
+  prerelease: z.literal(false),
+  body: z.string().nullable(),
+  assets: z.array(z.object({ name: z.string(), browser_download_url: z.string().url() })),
+});
+
+export async function checkForBuilderUpdates(currentVersion: string | undefined): Promise<UpdateInfo> {
+  const installed = versionSchema.parse(currentVersion);
+  const response = await fetch(`https://api.github.com/repos/${repository}/releases/latest`, {
+    headers: { Accept: 'application/vnd.github+json' },
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) throw new Error(`Android update check failed: HTTP ${response.status}`);
+  const release = releaseSchema.parse(await response.json());
+  if (!release.tag_name.startsWith('v')) throw new Error('Invalid Android release tag');
+  const version = versionSchema.parse(release.tag_name.slice(1));
+  const asset = release.assets.find((item) => item.name === `OpenChamber-${version}-android.apk`);
+  const expectedUrl = `https://github.com/${repository}/releases/download/${release.tag_name}/${asset?.name}`;
+  if (!asset || asset.browser_download_url !== expectedUrl) throw new Error('Android release APK is missing or has an unexpected URL');
+
+  const offeredParts = version.split('.').map(Number);
+  const installedParts = installed.split('.').map(Number);
+  const differentPart = offeredParts.findIndex((part, index) => part !== installedParts[index]);
+  const available = differentPart !== -1 && offeredParts[differentPart] > installedParts[differentPart];
+  return {
+    available,
+    version,
+    currentVersion: installed,
+    body: release.body ?? undefined,
+    releaseUrl: `https://github.com/${repository}/releases/tag/${release.tag_name}`,
+    downloadUrl: available ? asset.browser_download_url : undefined,
+    nextSuggestedCheckInSec: 3600,
+  };
+}
