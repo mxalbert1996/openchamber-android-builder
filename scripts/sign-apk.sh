@@ -1,27 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 tools="${ANDROID_HOME:?}/build-tools/35.0.0"
-keys="${RUNNER_TEMP:?}/aosp-testkey"
-source_url='https://android.googlesource.com/platform/build/+/874fa586c48ae230ebfcff0df1b9c1b004fa8f7c/target/product/security'
-mkdir -p "$keys" dist
-
-# Intentionally public AOSP test keys, pinned by commit and file digest.
-for name in testkey.pk8 testkey.x509.pem; do
-  curl --fail --silent --show-error --location --retry 3 \
-    "$source_url/$name?format=TEXT" | base64 --decode > "$keys/$name"
-done
-(
-  cd "$keys"
-  sha256sum --check <<'CHECKSUMS'
-495675d32e89a149d5abe191f4e9c0e218b9068714e9b53a7c91e164a0741a23  testkey.pk8
-a4384ba815b9499a5ce349b4e33c1755278873fe2eac150a068823f526e6dbde  testkey.x509.pem
-CHECKSUMS
-)
-
+keystore="${RUNNER_TEMP:?}/release.keystore"
 apk="dist/OpenChamber-${VERSION:?}-android.apk"
+
+# Public AOSP testkey and this repository's release key. Update the latter when
+# rotating the signing key; it keeps a wrong or missing secret from publishing.
+testkey_sha256='a40da80a59d170caa950cf15c18c454d47a39b26989d8b640ecd745ba71bf5dc'
+release_sha256='7a6e1b71617c60599d34d4b8784142023e2d1f7710ecb213647f8d2c51295fb2'
+
+: "${ANDROID_KEYSTORE_BASE64:?ANDROID_KEYSTORE_BASE64 secret is missing or empty}"
+: "${ANDROID_KEYSTORE_PASSWORD:?ANDROID_KEYSTORE_PASSWORD secret is missing or empty}"
+: "${ANDROID_KEY_ALIAS:?ANDROID_KEY_ALIAS secret is missing or empty}"
+: "${ANDROID_KEY_PASSWORD:?ANDROID_KEY_PASSWORD secret is missing or empty}"
+
+trap 'rm -f "$keystore"' EXIT
+mkdir -p dist
+
+printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+test -s "$keystore"
+
 "$tools/zipalign" -P 16 -f 4 unsigned/app-release-unsigned.apk "$RUNNER_TEMP/aligned.apk"
-"$tools/apksigner" sign --key "$keys/testkey.pk8" --cert "$keys/testkey.x509.pem" \
-  --v4-signing-enabled false --out "$apk" "$RUNNER_TEMP/aligned.apk"
+"$tools/apksigner" sign \
+  --ks "$keystore" \
+  --ks-type PKCS12 \
+  --ks-key-alias "$ANDROID_KEY_ALIAS" \
+  --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+  --key-pass env:ANDROID_KEY_PASSWORD \
+  --v4-signing-enabled false \
+  --out "$apk" "$RUNNER_TEMP/aligned.apk"
+
 "$tools/apksigner" verify --verbose --print-certs "$apk"
 "$tools/zipalign" -c -P 16 4 "$apk"
+
+digest=$("$tools/apksigner" verify --print-certs "$apk" \
+  | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr 'A-F' 'a-f')
+if [ "$digest" = "$testkey_sha256" ]; then
+  echo 'Refusing to publish an APK signed with the public AOSP test key' >&2
+  exit 1
+fi
+if [ "$digest" != "$release_sha256" ]; then
+  echo "Unexpected signing certificate: ${digest:-<none>}" >&2
+  echo 'Update release_sha256 in scripts/sign-apk.sh when rotating the key' >&2
+  exit 1
+fi
