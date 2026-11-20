@@ -2,8 +2,7 @@ name: Android stable
 
 on:
   schedule:
-    # 11:00 Asia/Tokyo (JST, UTC+9) every day.
-    - cron: '0 2 * * *'
+    - cron: '17 * * * *'
   repository_dispatch:
     types: [upstream-release]
   workflow_dispatch:
